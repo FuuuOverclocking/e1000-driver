@@ -76,8 +76,50 @@ module! {
 struct E1000Driver;
 
 impl E1000Driver {
-    fn handle_rx_irq(dev: &net::Device, napi: &Napi, data: &NetData) {  
+    fn handle_rx_irq(dev: &net::Device, napi: &Napi, data: &NetData) {
         // Exercise4 Checkpoint 1
+        let mut num_packets = 0;
+        let mut num_bytes = 0;
+
+        let packets: Option<Vec<Vec<u8>>> = {
+            let mut dev_e1000 = data.dev_e1000.lock_irqdisable();
+            dev_e1000.as_mut().unwrap().e1000_recv()
+        };
+
+        if let Some(packets) = packets {
+            num_packets = packets.len();
+
+            for packet in packets.iter() {
+                let len = packet.len();
+                let skb = dev.alloc_skb_ip_align(RXBUFFER).unwrap();
+                let skb_buff: &mut [u8] =
+                    unsafe { from_raw_parts_mut(skb.head_data().as_ptr() as *mut u8, len) };
+                skb_buff.copy_from_slice(packet);
+
+                skb.put(len as u32);
+                let protocol = skb.eth_type_trans(dev);
+                skb.protocol_set(protocol);
+
+                // Send the skb up the stack
+                napi.gro_receive(&skb);
+                num_bytes += len;
+            }
+
+            pr_info!(
+                "handle_rx_irq, received {} packets, totaling {} bytes.\n",
+                num_packets,
+                num_bytes
+            );
+        } else {
+            pr_warn!("handle_rx_irq, no packets received.\n");
+        }
+
+        data.stats
+            .rx_bytes
+            .fetch_add(num_bytes as u64, Ordering::Relaxed);
+        data.stats
+            .rx_packets
+            .fetch_add(num_packets as u64, Ordering::Relaxed);
     }
 
     fn handle_tx_irq() {
@@ -111,15 +153,10 @@ impl irq::Handler for E1000Driver {
             pr_warn!("No valid e1000 interrupt was found\n");
             return irq::Return::None;
         }
-
         data.napi.schedule();
 
         irq::Return::Handled
     }
-}
-
-fn request_irq(irq: u32, data: Box<IrqData>) -> Result<irq::Registration<E1000Driver>> {
-    irq::Registration::try_new(irq, data, irq::flags::SHARED, fmt!("e1000_{irq}"))
 }
 
 struct Poller;
@@ -231,13 +268,26 @@ impl net::DeviceOperations for E1000Driver {
             *dev_e1k = Some(e1000_device);
         }
 
-
         // Exercise3 Checkpoint 5
         // Enable interrupts
-        // step1 set up irq_data
-        // step2 request_irq
-        // step3 set up irq_handler
 
+        // step1 set up irq_data
+        let irq_data = Box::try_new(IrqData {
+            dev_e1000: Arc::clone(&data.dev_e1000),
+            res: Arc::clone(&data.res),
+            napi: Arc::clone(&data.napi),
+        })?;
+
+        // step2 request_irq
+        let irq_request_ptr = Box::into_raw(Box::try_new(irq::Registration::try_new(
+            data.irq,
+            irq_data,
+            irq::flags::SHARED,
+            fmt!("e1000_{}", data.irq),
+        )?)?);
+
+        // step3 set up irq_handler
+        data.irq_handler.store(irq_request_ptr, Ordering::Relaxed);
 
         // Enable NAPI scheduling
         data.napi.enable();
@@ -274,8 +324,36 @@ impl net::DeviceOperations for E1000Driver {
         dev: &Device,
         data: <Self::Data as PointerWrapper>::Borrowed<'_>,
     ) -> NetdevTx {
-        pr_info!("start xmit\n");
         // Exercise4 Checkpoint 2
+        skb.put_padto(bindings::ETH_ZLEN);
+
+        let skb_data = skb.head_data();
+
+        pr_info!("SkBuff len: {}, head len: {}\n", skb.len(), skb_data.len());
+        dev.sent_queue(skb.len());
+
+        let len = {
+            let mut dev_e1000 = data.dev_e1000.lock_irqdisable();
+            dev_e1000.as_mut().unwrap().e1000_transmit(skb_data)
+        };
+
+        if len < 0 {
+            pr_warn!("Failed to start_xmit skbuff packet len: {}", len);
+            return NetdevTx::Busy;
+        }
+
+        skb.napi_consume(64);
+
+        data.stats
+            .tx_bytes
+            .fetch_add(skb.len() as u64, Ordering::Relaxed);
+        data.stats
+            .tx_packets
+            .fetch_add(1, Ordering::Relaxed);
+
+        dev.completed_queue(1, skb.len() as u32);
+
+        NetdevTx::Ok
     }
 
     /// Corresponds to `ndo_get_stats64` in `struct net_device_ops`.
@@ -291,7 +369,7 @@ impl net::DeviceOperations for E1000Driver {
     /// Corresponds to `ndo_stop` in `struct net_device_ops`.
     fn stop(dev: &Device, data: <Self::Data as PointerWrapper>::Borrowed<'_>) -> Result {
         pr_warn!("net::DeviceOperations::stop() unimplemented!\n");
-        drop(data);
+        // drop(data); // 不可变借用 的 drop 没有意义
         Ok(())
     }
 }
@@ -373,7 +451,7 @@ impl pci::Driver for E1000Driver {
     }
     fn remove(data: &Self::Data) {
         pr_info!("PCI Driver remove\n");
-        drop(data);
+        // drop(data); // 不可变借用 的 drop 没有意义
     }
     define_pci_id_table! {u32, [
         (pci::DeviceId::new(VENDOR_ID_INTEL_82540EM, DEVICE_ID_INTEL_82540EM), Some(0x1)),
